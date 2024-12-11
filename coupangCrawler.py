@@ -3,12 +3,10 @@ import pymysql
 import logging
 import time
 import random
-import math
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-
+from selenium.webdriver.common.proxy import Proxy, ProxyType
 
 class CoupangCrawler:
     def __init__(self):
@@ -29,6 +27,14 @@ class CoupangCrawler:
     def setup_database(self):
         try:
             self.db_config = {
+                "host": "",
+                "port": "",
+                "user": "",
+                "password": "",                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+                
+                "database": "",
+                "charset": "utf8mb4",
+                "cursorclass": pymysql.cursors.DictCursor,
             }
             self.test_connection()
         except Exception as e:
@@ -55,33 +61,65 @@ class CoupangCrawler:
             with self.get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
-
+                        SELECT DISTINCT PRODUCT_CODE, OPTION_CODE 
+                        FROM CPS_PRODUCT 
+                        WHERE PRODUCT_CODE IS NOT NULL AND OPTION_CODE IS NOT NULL
                     """)
                     results = cursor.fetchall()
                     return [{"product_code": row["PRODUCT_CODE"], "option_code": row["OPTION_CODE"]} for row in results]
         except Exception as e:
             self.logger.error(f"데이터 조회 실패: {str(e)}")
-            return []
+            return []      
 
-    def crawl_chunk(self, product_chunk):
-        success = 0
+    def update_product(self, product_code, option_code):
+        try:
+            with self.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    sql = """
+                        UPDATE CPS_PRODUCT 
+                        SET MOD_DATE = NOW() 
+                        WHERE PRODUCT_CODE = %s AND OPTION_CODE = %s
+                    """
+                    result = cursor.execute(sql, (product_code, option_code))
+                    conn.commit()
+                    return result > 0
+        except Exception as e:
+            self.logger.error(f"데이터 업데이트 실패: {str(e)}")
+            return False
+
+    def crawl_products(self, product_chunk):
+        success = 0 
         failed = 0
-
+        total = 0;
         for product in product_chunk:
+            # try:
+            #     import psutil
+            #     # 크롬드라이버와 크롬 프로세스 모두 종료
+            #     for proc in psutil.process_iter():
+            #         try:
+            #             if "chromedriver" in proc.name().lower() or "chrome.exe" in proc.name().lower():
+            #                 proc.kill()
+            #         except (psutil.NoSuchProcess, psutil.AccessDenied):
+            #             pass
+            # except Exception:
+            #     pass
+
             driver = None
             try:
                 options = uc.ChromeOptions()
-                options.add_argument("--headless")
+
+                options.add_argument("--headless=new")
                 options.add_argument("--no-sandbox")
                 options.add_argument("--disable-dev-shm-usage")
                 options.add_argument("--disable-gpu")
                 options.add_argument("--window-size=1920,1080")
+
                 debug_port = random.randint(9222, 9999)
                 options.add_argument(f"--remote-debugging-port={debug_port}")
                 options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 
                 driver = uc.Chrome(options=options)
-                
+                driver.set_page_load_timeout(30)
                 url = f"https://www.coupang.com/vp/products/{product['product_code']}?itemId={product['option_code']}"
                 driver.get(url)
 
@@ -94,7 +132,8 @@ class CoupangCrawler:
                     "rocket_status" : "",
                     "price" : "",
                     "rocket_price" : "",
-                    "card_info" : {}
+                    "card_info" : {},
+                    "data_none" : ""
                 }
 
                 # 상품명 확인
@@ -106,7 +145,7 @@ class CoupangCrawler:
                 # 카테고리 및 마우스 액션
                 try:
                     category_element = driver.find_element(By.XPATH, "(//ul[@id='breadcrumb']/li)[3]")
-                    product_data["category"] = category_element.find_element(By.TAG_NAME, "a").get_attribute("title")
+                    product_data["category"] = category_element.find_element(By.TAG_NAME, "a").get_dom_attribute("title")
                     
                     # 마우스 움직임 시뮬레이션
                     actions = ActionChains(driver)
@@ -123,7 +162,7 @@ class CoupangCrawler:
                     badges = driver.find_elements(By.CLASS_NAME, "td-delivery-badge")
                     for badge in badges:
                         img = badge.find_element(By.TAG_NAME, "img")
-                        src = img.get_attribute("src")
+                        src = img.get_dom_attribute("src")
                         if "rocket-fresh" in src:
                             product_data["rocket_status"] = "fresh"
                             break
@@ -161,9 +200,9 @@ class CoupangCrawler:
                     for badge in benefit_badges:
                         try:
                             img = badge.find_element(By.CSS_SELECTOR, "img.benefit-ico")
-                            src = img.get_attribute("src")
+                            src = img.get_dom_attribute("src")
                             if "@" in src:
-                                card_info = {
+                                card_info = {                                                                                                                                                                                                                             
                                     "merchant_id": "coupang",
                                     "product_code": product["product_code"],
                                     "option_code": product["option_code"],
@@ -176,8 +215,21 @@ class CoupangCrawler:
                             continue
                 except Exception:
                     pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                try:
+                    product_data["data_none"] = driver.find_element(By.CSS_SELECTOR, "div.prod-not-find-unknown a.prod-not-find-unknown__p").text
+                except Exception:
+                    pass
 
-                success += 1
+                # 메서드 호출 시 필요한 모든 파라미터 전달
+                if product_data.get("name") or product_data.get("data_none") is False:
+                    result = self.update_product(product_data["product_code"], product_data["option_code"])
+                    if result > 0:
+                        print("업데이트 성공")
+                        success += 1
+                        print(f"{len(product_chunk)}중 {success}개 성공")                                                                                                                                                                                                                                                                                                                              
+                else:
+                    print("업데이트 실패")
 
                 # 크롤링 결과 출력
                 print("\n" + "=" * 50)
@@ -192,15 +244,6 @@ class CoupangCrawler:
                 if driver:
                     driver.quit()
                 time.sleep(random.uniform(1, 3))
-
-    def crawl_products(self, product_list):
-        # 상품 목록을 3개의 청크로 분할
-        chunk_size = math.ceil(len(product_list) / 1)
-        chunks = [product_list[i:i + chunk_size] for i in range(0, len(product_list), chunk_size)]
-        
-        # ThreadPoolExecutor로 3개의 스레드 생성 및 실행
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            executor.map(self.crawl_chunk, chunks)
 
 if __name__ == "__main__":
     crawler = None
